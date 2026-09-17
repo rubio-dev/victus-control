@@ -37,6 +37,10 @@ static std::string requested_mode = "AUTO";
 static std::atomic<bool> fan_mode_requires_root(false);
 
 static std::atomic<bool> better_auto_running(false);
+// Published for GET_BETTER_AUTO_STATUS; written by the control loop only.
+static std::atomic<int> better_auto_pub_level(0);
+static std::atomic<int> better_auto_pub_value(0);
+static std::atomic<bool> better_auto_pub_usage_driven(false);
 static std::thread better_auto_thread;
 static std::chrono::steady_clock::time_point better_auto_last_manual_assert;
 
@@ -67,13 +71,27 @@ static std::mutex cpu_usage_mutex;
 static std::optional<CpuSampleTimes> previous_cpu_times;
 
 static constexpr int kBetterAutoMinRpm = 2000;
-static constexpr std::array<int, 2> kBetterAutoMaxFallback = {5800, 6100};
+// Used when the driver cannot tell us the ceiling. fanN_max reads 0 on this
+// board because the EC's fan table query returns zeroes at module init, so
+// these are the speeds both fans actually reach in MAX, measured on the
+// hardware. The old 5800/6100 guess spread the curve over RPM that do not
+// exist, which flattened the top levels into each other.
+static constexpr std::array<int, 2> kBetterAutoMaxFallback = {5100, 5100};
 static constexpr int kBetterAutoSteps = 8;
 static constexpr std::chrono::seconds kBetterAutoTick{2};
 static constexpr std::chrono::seconds kBetterAutoReapply{90};
 static constexpr int kBetterAutoCooldownLevel = 5;
 static constexpr std::chrono::seconds kBetterAutoCooldown{90};
+// Upper bound on the wait between writing one fan and the other. It is a cap,
+// not a delay: hp_wmi_set_fan_speed() re-reads the other fan's *measured* speed
+// and re-sends it as that fan's target, so touching fan 2 while fan 1 is still
+// ramping pins fan 1 wherever it happens to be. Waiting for fan 1 to arrive
+// instead of always burning the full ten seconds lets a one-level change settle
+// in a few seconds, which is most changes.
 static constexpr std::chrono::seconds kFanApplyGap{10};
+static constexpr std::chrono::milliseconds kFanSettlePoll{500};
+// Readings quantise to 100 RPM, so anything inside this counts as arrived.
+static constexpr int kFanSettleToleranceRpm = 150;
 static constexpr const char *kSudoPath = "/usr/bin/sudo";
 static constexpr const char *kFanModeHelperPath = "/usr/bin/set-fan-mode.sh";
 static constexpr const char *kFanSpeedHelperPath = "/usr/bin/set-fan-speed.sh";
@@ -596,10 +614,22 @@ static int clamp_to_fan_limits(size_t index, int rpm)
     return std::min(rpm, max_rpm);
 }
 
-static int level_from_thresholds(double value, const std::array<double, 7> &thresholds)
+// Thresholds are sticky downwards: a level already reached is only given up
+// once the reading falls `margin` below the threshold it climbed through.
+// Without it a value parked on a boundary flips the level every couple of
+// seconds — at 45 C the fans swung ~540 RPM back and forth, which is both
+// audible and a fan write each way.
+static int level_from_thresholds(double value, const std::array<double, 7> &thresholds,
+                                 int previous_level, double margin)
 {
     int level = 1;
-    for (double threshold : thresholds) {
+    for (size_t i = 0; i < thresholds.size(); ++i) {
+        double threshold = thresholds[i];
+        // thresholds[i] is the boundary into level i + 2. Lower it while we are
+        // already at or above that level.
+        if (static_cast<int>(i) + 2 <= previous_level) {
+            threshold -= margin;
+        }
         if (value >= threshold) {
             ++level;
         }
@@ -633,7 +663,30 @@ static std::array<int, 2> rpm_for_level(int level)
     return {rpm_for_level_for_fan(level, 0), rpm_for_level_for_fan(level, 1)};
 }
 
-static int level_from_snapshot(const ThermalSnapshot &snapshot, int previous_level)
+int better_auto_level_count()
+{
+    return kBetterAutoSteps;
+}
+
+// Median of the samples collected so far, after adding this one. With an even
+// count take the lower of the middle pair: at the start of a ramp, waiting one
+// more tick is the cheaper mistake.
+static double push_and_median(BetterAutoFilter &filter, double sample)
+{
+    filter.samples[filter.next] = sample;
+    filter.next = (filter.next + 1) % kBetterAutoTempWindow;
+    if (filter.count < kBetterAutoTempWindow) {
+        ++filter.count;
+    }
+
+    std::array<double, kBetterAutoTempWindow> sorted{};
+    std::copy_n(filter.samples.begin(), filter.count, sorted.begin());
+    std::sort(sorted.begin(), sorted.begin() + filter.count);
+    return sorted[(filter.count - 1) / 2];
+}
+
+int better_auto_next_level(BetterAutoFilter &filter, const BetterAutoReading &reading,
+                           int previous_level)
 {
     // Levels 1-8 map to ~2000→max RPM. Thresholds define boundaries between consecutive levels.
     // Temp: <45°C=L1(silent), 45-54=L2, 54-62=L3, 62-68=L4, 68-73=L5, 73-78=L6, 78-83=L7, >83=L8(max)
@@ -641,41 +694,114 @@ static int level_from_snapshot(const ThermalSnapshot &snapshot, int previous_lev
     const std::array<double, 7> temp_thresholds = {45.0, 54.0, 62.0, 68.0, 73.0, 78.0, 83.0};
     const std::array<double, 7> usage_thresholds = {30.0, 45.0, 55.0, 65.0, 75.0, 85.0, 92.0};
 
-    double hottest = 0.0;
-    bool have_temp = false;
-    if (snapshot.cpu_temp_c) {
-        hottest = std::max(hottest, *snapshot.cpu_temp_c);
-        have_temp = true;
-    }
-    if (snapshot.gpu_temp_c) {
-        hottest = std::max(hottest, *snapshot.gpu_temp_c);
-        have_temp = true;
+    previous_level = std::clamp(previous_level, 1, kBetterAutoSteps);
+
+    // With no temperature at all there is nothing to smooth and nothing to call
+    // an emergency: hold the level the fans already run at.
+    int temp_level = previous_level;
+    if (reading.have_temp) {
+        filter.smoothed_c = push_and_median(filter, reading.hottest_c);
+        temp_level = level_from_thresholds(filter.smoothed_c, temp_thresholds,
+                                           previous_level, kBetterAutoHysteresisC);
+        filter.hot_streak = (reading.hottest_c >= kBetterAutoEmergencyTempC) ? filter.hot_streak + 1 : 0;
+    } else {
+        filter.hot_streak = 0;
     }
 
-    int temp_level = have_temp ? level_from_thresholds(hottest, temp_thresholds) : previous_level;
-
-    double usage_pct = 0.0;
-    bool have_usage = false;
-    if (snapshot.cpu_usage_pct) {
-        usage_pct = std::max(usage_pct, *snapshot.cpu_usage_pct);
-        have_usage = true;
-    }
-    if (snapshot.gpu_usage_pct) {
-        usage_pct = std::max(usage_pct, *snapshot.gpu_usage_pct);
-        have_usage = true;
+    // Heat that survives two samples in a row is not a turbo transient. Skip
+    // both the median and the rise limit and spin up now.
+    if (filter.hot_streak >= kBetterAutoEmergencySamples) {
+        return kBetterAutoSteps;
     }
 
-    int usage_level = have_usage ? level_from_thresholds(usage_pct, usage_thresholds) : 1;
+    int usage_level = 1;
+    if (reading.have_usage) {
+        usage_level = std::min(level_from_thresholds(reading.usage_pct, usage_thresholds,
+                                                     previous_level, kBetterAutoHysteresisPct),
+                               kBetterAutoMaxUsageLevel);
+    }
 
     int target_level = std::max(temp_level, usage_level);
     target_level = std::clamp(target_level, 1, kBetterAutoSteps);
 
-    if (target_level < previous_level) {
+    filter.usage_pct = reading.have_usage ? reading.usage_pct : 0.0;
+    filter.usage_driven = usage_level > temp_level;
+
+    if (target_level > previous_level) {
+        // Climb gradually: a jump straight to the top should take sustained
+        // heat, which the emergency path above handles, not one hot sample.
+        target_level = std::min(target_level, previous_level + kBetterAutoMaxRisePerTick);
+    } else if (target_level < previous_level) {
         // Drop at most one step per sample to avoid oscillations
         target_level = std::max(target_level, previous_level - 1);
     }
 
     return target_level;
+}
+
+static int level_from_snapshot(BetterAutoFilter &filter, const ThermalSnapshot &snapshot,
+                               int previous_level)
+{
+    BetterAutoReading reading;
+
+    if (snapshot.cpu_temp_c) {
+        reading.hottest_c = std::max(reading.hottest_c, *snapshot.cpu_temp_c);
+        reading.have_temp = true;
+    }
+    if (snapshot.gpu_temp_c) {
+        reading.hottest_c = std::max(reading.hottest_c, *snapshot.gpu_temp_c);
+        reading.have_temp = true;
+    }
+
+    if (snapshot.cpu_usage_pct) {
+        reading.usage_pct = std::max(reading.usage_pct, *snapshot.cpu_usage_pct);
+        reading.have_usage = true;
+    }
+    if (snapshot.gpu_usage_pct) {
+        reading.usage_pct = std::max(reading.usage_pct, *snapshot.gpu_usage_pct);
+        reading.have_usage = true;
+    }
+
+    return better_auto_next_level(filter, reading, previous_level);
+}
+
+
+// True once fan 1 reads within tolerance of what it was last told to do. When
+// there is no commanded target, or the reading cannot be parsed, it reports
+// settled rather than stalling the caller.
+static bool fan1_reached_target()
+{
+    std::string target;
+    {
+        std::lock_guard<std::mutex> lock(fan_state_mutex);
+        if (!last_fan1_speed) {
+            return true;
+        }
+        target = *last_fan1_speed;
+    }
+
+    try {
+        int reading = std::stoi(get_fan_speed("1"));
+        return std::abs(reading - std::stoi(target)) <= kFanSettleToleranceRpm;
+    } catch (...) {
+        return true;
+    }
+}
+
+// Block until fan 1 has arrived at its target, `deadline` passes, or the caller
+// asks to stop.
+static void wait_until_fan1_settles(std::chrono::steady_clock::time_point deadline,
+                                    const std::atomic<bool> *keep_going = nullptr)
+{
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (keep_going && !keep_going->load(std::memory_order_acquire)) {
+            return;
+        }
+        if (fan1_reached_target()) {
+            return;
+        }
+        std::this_thread::sleep_for(kFanSettlePoll);
+    }
 }
 
 static void stop_better_auto();
@@ -823,6 +949,7 @@ static void better_auto_worker()
     std::cout << "better-auto: control loop started" << std::endl;
     int current_level = 1;
     int sensor_level = 1;
+    BetterAutoFilter filter;
     auto last_apply = std::chrono::steady_clock::time_point::min();
     better_auto_last_manual_assert = std::chrono::steady_clock::time_point::min();
     auto cooldown_until = std::chrono::steady_clock::time_point::min();
@@ -830,7 +957,11 @@ static void better_auto_worker()
 
     while (better_auto_running.load(std::memory_order_acquire)) {
         ThermalSnapshot snapshot = collect_snapshot();
-        sensor_level = level_from_snapshot(snapshot, sensor_level);
+        sensor_level = level_from_snapshot(filter, snapshot, sensor_level);
+        better_auto_pub_usage_driven.store(filter.usage_driven, std::memory_order_relaxed);
+        better_auto_pub_value.store(static_cast<int>(std::lround(filter.usage_driven ? filter.usage_pct
+                                                                                     : filter.smoothed_c)),
+                                    std::memory_order_relaxed);
         int target_level = sensor_level;
         auto now = std::chrono::steady_clock::now();
 
@@ -846,6 +977,7 @@ static void better_auto_worker()
                       << (snapshot.cpu_usage_pct ? std::to_string(static_cast<int>(*snapshot.cpu_usage_pct)) : "n/a")
                       << " gpu_use="
                       << (snapshot.gpu_usage_pct ? std::to_string(static_cast<int>(*snapshot.gpu_usage_pct)) : "n/a")
+                      << " temp_median=" << static_cast<int>(filter.smoothed_c)
                       << " level=" << sensor_level << std::endl;
             last_logged_level = sensor_level;
         }
@@ -873,6 +1005,11 @@ static void better_auto_worker()
             target_level = std::max(target_level, current_level - 1);
         }
 
+        // Publish as soon as the level is decided, not after it is applied: the
+        // apply takes kFanApplyGap to walk both fans, and until then the UI had
+        // nothing to show but the bare mode name.
+        better_auto_pub_level.store(target_level, std::memory_order_relaxed);
+
         bool need_apply = (target_level != current_level) ||
                           (last_apply == std::chrono::steady_clock::time_point::min()) ||
                           (now - last_apply >= kBetterAutoReapply);
@@ -887,13 +1024,8 @@ static void better_auto_worker()
                 std::cerr << "better-auto: failed to set fan 1 speed: " << result1 << std::endl;
             }
 
-            const int gap_seconds = static_cast<int>(kFanApplyGap.count());
-            for (int i = 0; i < gap_seconds; ++i) {
-                if (!better_auto_running.load(std::memory_order_acquire)) {
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
+            wait_until_fan1_settles(std::chrono::steady_clock::now() + kFanApplyGap,
+                                    &better_auto_running);
 
             if (!better_auto_running.load(std::memory_order_acquire)) {
                 break;
@@ -929,6 +1061,7 @@ static void better_auto_worker()
         }
     }
 
+    better_auto_pub_level.store(0, std::memory_order_relaxed);
     std::cout << "better-auto: control loop stopped" << std::endl;
 }
 
@@ -1030,6 +1163,7 @@ void fan_mode_trigger(const std::string mode) {
 	if (mode == "AUTO" || mode == "BETTER_AUTO") return;
 
     std::thread([mode, gen = fan_thread_generation.load()]() {
+        bool first_pass = true;
         while (fan_thread_generation == gen) {
             // Reapply the fan mode directly via hwmon
             auto result = write_hw_fan_mode(mode);
@@ -1037,10 +1171,17 @@ void fan_mode_trigger(const std::string mode) {
                 std::cerr << "fan_mode_trigger: failed to assert mode " << mode << ": " << result << std::endl;
             }
 
-            // Reapply fan settings if in manual mode
-            if (mode == "MANUAL") {
+            // Not on the first pass. This watchdog is spawned by the very call
+            // that just wrote the speeds, so an immediate reapply rewrites what
+            // is already there -- and worse, rewriting fan 1 holds the apply
+            // lock and restarts fan 1's ramp, so a fan 2 write issued right
+            // afterwards queues behind it and lands later than the gap. The
+            // firmware only forgets the settings after ~120 s, so asserting the
+            // mode now and reapplying on the next pass is in good time.
+            if (mode == "MANUAL" && !first_pass) {
                 reapply_fan_settings();
             }
+            first_pass = false;
 
             // Wait for the interval (90 seconds)
             for (int i = 0; i < 90; ++i) {
@@ -1127,6 +1268,18 @@ std::string set_fan_mode(const std::string &mode)
 
     stop_better_auto();
 
+    // pwm1_enable=0 asks the EC for maximum but the driver leaves any manual
+    // fan targets in place, and those win: measured 2400 RPM with targets still
+    // set against 5100 RPM once released. Only the AUTO path runs the driver's
+    // fan_speed_max_reset, so pass through it first. Back to back is enough;
+    // no settling delay is needed between the two.
+    if (mode == "MAX") {
+        auto release = write_hw_fan_mode("AUTO");
+        if (release != "OK") {
+            std::cerr << "Failed to release fan targets before MAX: " << release << std::endl;
+        }
+    }
+
     auto result = write_hw_fan_mode(mode);
     if (result == "OK") {
         std::lock_guard<std::mutex> lock(mode_mutex);
@@ -1161,6 +1314,23 @@ std::string restore_firmware_fan_control()
         requested_mode = "AUTO";
     }
     return result;
+}
+
+std::string get_better_auto_status()
+{
+    if (!better_auto_running.load(std::memory_order_acquire)) {
+        return "INACTIVE";
+    }
+
+    int level = better_auto_pub_level.load(std::memory_order_relaxed);
+    if (level <= 0) {
+        // The loop is up but has not applied a level yet.
+        return "INACTIVE";
+    }
+
+    return std::to_string(level) + " " + std::to_string(better_auto_level_count()) + " " +
+           (better_auto_pub_usage_driven.load(std::memory_order_relaxed) ? "LOAD" : "TEMP") + " " +
+           std::to_string(better_auto_pub_value.load(std::memory_order_relaxed));
 }
 
 std::string ensure_better_auto_mode()
@@ -1319,9 +1489,8 @@ std::string set_fan_speed(const std::string &fan_num, const std::string &speed, 
     if (index == 1 && fan_last_apply[0] != std::chrono::steady_clock::time_point::min()) {
         auto elapsed = now - fan_last_apply[0];
         if (elapsed < kFanApplyGap) {
-            auto wait_duration = kFanApplyGap - elapsed;
             apply_lock.unlock();
-            std::this_thread::sleep_for(wait_duration);
+            wait_until_fan1_settles(fan_last_apply[0] + kFanApplyGap);
             apply_lock.lock();
         }
     }

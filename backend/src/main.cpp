@@ -196,6 +196,12 @@ void handle_command(const std::string &command_str, int client_socket) {
     } else {
       response = "ERROR: Invalid GET_FAN_TARGET_SUPPORT command format";
     }
+  } else if (command == "GET_BETTER_AUTO_STATUS") {
+    if (!has_extra_tokens(ss)) {
+      response = get_better_auto_status();
+    } else {
+      response = "ERROR: Invalid GET_BETTER_AUTO_STATUS command format";
+    }
   } else if (command == "GET_CPU_TEMP") {
     if (!has_extra_tokens(ss)) {
       response = get_cpu_temperature();
