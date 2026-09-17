@@ -1,0 +1,49 @@
+From 93c406bfb5e72e80b0f3d63996045976bb5ebe45 Mon Sep 17 00:00:00 2001
+From: Emilio Rubio <rubiovp12@gmail.com>
+Date: Wed, 16 Sep 2026 23:02:19 -0700
+Subject: [PATCH] platform/x86: hp-wmi: Add Victus 15-fa1xxx fan and thermal
+ profile support
+
+Board 8BC8 (Victus by HP Gaming Laptop 15-fa1xxx) is missing from
+hp_wmi_feature_boards[], so neither platform profile handling nor fan
+control is wired up on it.
+
+The firmware on this board reports no software fan support through
+HPWMI_GET_SYSTEM_DESIGN_DATA (byte 4 reads 0), but the EC does accept the
+fan commands: writing fan targets makes both fans reach the requested
+speed, the max-speed query drives them to their maximum, and
+HPWMI_FAN_SPEED_SET_QUERY with HP_FAN_SPEED_AUTOMATIC hands them back to
+the firmware curve. Since hp_wmi_fan_control_supported() keys off the
+board table rather than that query, adding the board is enough.
+
+Tested on a Victus 15-fa1xxx:
+ - both fans reach their requested target (4000 RPM requested, 4000 RPM
+   read back) and max mode reaches 5073 RPM
+ - both fans return to the firmware curve after the automatic reset
+ - the low-power, balanced and performance profiles are accepted, read
+   back correctly and change fan behaviour (2200/2000 RPM on balanced
+   against 2500/2400 RPM on performance)
+
+Signed-off-by: Emilio Rubio <rubiovp12@gmail.com>
+---
+ drivers/platform/x86/hp/hp-wmi.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/platform/x86/hp/hp-wmi.c b/drivers/platform/x86/hp/hp-wmi.c
+index 615b4cf..60e2e2e 100644
+--- a/drivers/platform/x86/hp/hp-wmi.c
++++ b/drivers/platform/x86/hp/hp-wmi.c
+@@ -283,6 +283,10 @@ static const struct dmi_system_id hp_wmi_feature_boards[] __initconst = {
+ 		.matches = { DMI_MATCH(DMI_BOARD_NAME, "8BC2") },
+ 		.driver_data = (void *)&omen_v1_board_params,
+ 	},
++	{
++		.matches = { DMI_MATCH(DMI_BOARD_NAME, "8BC8") },
++		.driver_data = (void *)&victus_s_board_params,
++	},
+ 	{
+ 		.matches = { DMI_MATCH(DMI_BOARD_NAME, "8BCA") },
+ 		.driver_data = (void *)&omen_v1_board_params,
+-- 
+2.55.0
+

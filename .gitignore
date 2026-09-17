@@ -12,3 +12,4 @@ hp-wmi-fan-and-backlight-control/
 # Python bytecode cache (monitor/)
 __pycache__/
 *.pyc
+board-8bc8/dkms/hp-wmi.c

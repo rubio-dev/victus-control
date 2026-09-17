@@ -84,7 +84,12 @@ out-of-tree DKMS module alike, even though its neighbours `8BC2`, `8BCA` and
 `8BCD` are listed. The firmware compounds it by reporting that the machine has
 no software fan support — `HPWMI_GET_SYSTEM_DESIGN_DATA` byte 4 reads 0 — which
 is simply untrue: the EC accepts manual targets and both fans reach them
-exactly. Listing the board is all it takes.
+exactly. Listing the board is all it takes, and
+[`board-8bc8/`](board-8bc8/) carries both ways of doing that: a four-line patch
+for mainline, and a DKMS package that builds the stock driver of your kernel
+series with the entry added. Read its notes first — the stock driver exposes a
+different hwmon interface, so it is not a drop-in swap for the module this
+project installs.
 
 ### Better Auto judges heat, not spikes
 
