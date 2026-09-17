@@ -45,11 +45,15 @@ RATE_LIMIT_S = 60.0
 
 # Sustained-temperature alert thresholds: fire if temp stays above threshold
 # for the given duration continuously.
-CPU_SUSTAINED_85_SECS = 12.0
-CPU_SUSTAINED_90_SECS = 9.0
+#
+# Nothing warns below 95 C on the CPU. This chip's Tjmax is 100 C and it is
+# built to sit in the 80s under load, so alerts at 85 and 90 fire during
+# ordinary gaming and compiling: not news, just alarming. What is worth
+# interrupting someone for is a CPU that will not come down from 95, or one at
+# the point where it throttles. Same for the GPU, where a mobile RTX 4060
+# throttles around 87 C and 80 C is a normal working temperature.
 CPU_SUSTAINED_95_SECS = 6.0
 CPU_SUSTAINED_100_SECS = 3.0
-GPU_SUSTAINED_80_SECS = 12.0
 GPU_SUSTAINED_85_SECS = 9.0
 
 APP_NAME = "Victus Control"
@@ -175,7 +179,15 @@ class SustainedAlert:
                 self.above_since = None
                 self.armed = False
                 return True
-        elif temp_c <= self.threshold_c - REARM_MARGIN_C:
+        else:
+            # Any reading below the threshold ends the streak. This used to
+            # clear it only once the temperature fell a full REARM_MARGIN_C
+            # below, so a single turbo spike started the clock, every reading in
+            # between kept it running, and the next spike seconds later fired an
+            # alert claiming the CPU had been above 90 the whole time. It never
+            # was: this package sensor jumps 44 -> 86 -> 44 in about a second
+            # whenever one core boosts. REARM_MARGIN_C is for re-arming after a
+            # real alert, which is a different job.
             self.above_since = None
 
         return False
@@ -189,11 +201,8 @@ def main():
 
     cooling = Category(min(CPU_HOT_C, GPU_HOT_C))
 
-    cpu_85 = SustainedAlert(85.0, CPU_SUSTAINED_85_SECS)
-    cpu_90 = SustainedAlert(90.0, CPU_SUSTAINED_90_SECS)
     cpu_95 = SustainedAlert(95.0, CPU_SUSTAINED_95_SECS)
     cpu_100 = SustainedAlert(100.0, CPU_SUSTAINED_100_SECS)
-    gpu_80 = SustainedAlert(80.0, GPU_SUSTAINED_80_SECS)
     gpu_85 = SustainedAlert(85.0, GPU_SUSTAINED_85_SECS)
 
     print("victus-monitor: watching temperatures", file=sys.stderr)
@@ -208,16 +217,6 @@ def main():
         fan2 = parse_rpm(query("GET_FAN_SPEED 2"))
 
         # Sustained-temperature alerts (fire regardless of fan/mode state).
-        if cpu_85.update(cpu, now):
-            notify("CPU running hot",
-                   f"CPU above 85 °C for {CPU_SUSTAINED_85_SECS:.0f} s (now {cpu:.0f} °C). "
-                   f"Check active workloads.")
-
-        if cpu_90.update(cpu, now):
-            notify("CPU very hot",
-                   f"CPU above 90 °C for {CPU_SUSTAINED_90_SECS:.0f} s (now {cpu:.0f} °C). "
-                   f"Close heavy workloads.")
-
         if cpu_95.update(cpu, now):
             notify("CPU critical temperature",
                    f"CPU above 95 °C for {CPU_SUSTAINED_95_SECS:.0f} s (now {cpu:.0f} °C). "
@@ -227,11 +226,6 @@ def main():
             notify("CPU dangerously hot",
                    f"CPU above 100 °C for {CPU_SUSTAINED_100_SECS:.0f} s (now {cpu:.0f} °C). "
                    f"System may throttle or shut down.")
-
-        if gpu_80.update(gpu, now):
-            notify("GPU running hot",
-                   f"GPU above 80 °C for {GPU_SUSTAINED_80_SECS:.0f} s (now {gpu:.0f} °C). "
-                   f"Check active workloads.")
 
         if gpu_85.update(gpu, now):
             notify("GPU critical temperature",
