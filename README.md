@@ -26,6 +26,13 @@ privileged backend, a GTK4 desktop app, and a GNOME Shell extension.
 
 ---
 
+> **This is a fork of [Batuhan4/victus-control](https://github.com/Batuhan4/victus-control).**
+> It adds support for the Victus 15-fa1xxx (DMI board `8BC8`) and a set of fan
+> control and interface fixes found by measuring on that machine. See
+> [About this fork](#about-this-fork).
+
+---
+
 <div align="center">
 
 <img src="docs/images/screenshot-dashboard.png" width="620" alt="victus-control dashboard">
@@ -38,6 +45,7 @@ privileged backend, a GTK4 desktop app, and a GNOME Shell extension.
 
 ## Contents
 
+- [About this fork](#about-this-fork)
 - [Why victus-control](#why-victus-control)
 - [Quick install](#quick-install)
 - [Support matrix](#support-matrix)
@@ -51,6 +59,100 @@ privileged backend, a GTK4 desktop app, and a GNOME Shell extension.
 - [Troubleshooting](#troubleshooting)
 - [Contributing](#contributing)
 - [License](#license)
+
+---
+
+## About this fork
+
+Upstream is [Batuhan4/victus-control](https://github.com/Batuhan4/victus-control),
+and everything it does still works here. This fork is maintained for a **Victus
+by HP Gaming Laptop 15-fa1xxx** — DMI board `8BC8`, Intel Core i5-13420H,
+RTX 3050, Fedora — and adds what follows. All of it was found by measuring on
+that machine rather than by reading code, so the numbers below are real
+readings.
+
+<div align="center">
+
+<img src="docs/images/screenshot-cooling-light.png" width="620" alt="cooling card">
+
+</div>
+
+### The board
+
+`8BC8` is missing from the `hp-wmi` driver's board table, in mainline and in the
+out-of-tree DKMS module alike, even though its neighbours `8BC2`, `8BCA` and
+`8BCD` are listed. The firmware compounds it by reporting that the machine has
+no software fan support — `HPWMI_GET_SYSTEM_DESIGN_DATA` byte 4 reads 0 — which
+is simply untrue: the EC accepts manual targets and both fans reach them
+exactly. Listing the board is all it takes.
+
+### Better Auto judges heat, not spikes
+
+The CPU package sensor swings from 44 °C to 86 °C and back inside a second
+whenever a single core takes a turbo burst. Measured here at 50 ms resolution,
+with one core busy for 1.5 s:
+
+```
+t=2.51s  44 C
+t=2.76s  86 C     <- one core boosting
+t=3.51s  86 C
+t=3.77s  47 C
+```
+
+That is a real silicon reading, but it is a die hotspot with almost no energy
+behind it — the heatsink never feels it. Deciding on one such sample sent the
+fans to maximum at 3 % CPU load, and since the level walked back down one step
+per apply, a 2 s spike cost about 90 s of full-speed noise. Better Auto now
+decides on the median of the last three samples, climbs at most two steps at a
+time, keeps CPU/GPU load from reaching the top of the curve on its own, and
+holds a level until the temperature drops clear of the threshold it climbed
+through, so an idle machine sitting on a boundary no longer swings the fans
+±540 RPM every few seconds. Genuinely sustained heat still goes straight to
+maximum.
+
+### Fan control fixes
+
+- **MAX did nothing.** Writing `pwm1_enable=0` asks the EC for maximum but
+  leaves any manual fan targets in place, and those win: measured 2400 RPM with
+  targets still set against 5100 RPM once released. Only the AUTO path runs the
+  driver's `fan_speed_max_reset`, so MAX now passes through it first.
+- **The real ceiling is 5100 RPM, not 5800/6100.** `fanN_max` reads 0 on this
+  board because the EC's fan table query returns zeroes at module init, so the
+  curve was spread over RPM that do not exist and the top levels collapsed into
+  each other. Both fans were measured under MAX instead.
+- **Fan 2 lagged.** `hp_wmi_set_fan_speed()` re-reads the other fan's *measured*
+  speed and re-sends it as that fan's target, so touching fan 2 while fan 1 is
+  still ramping pins fan 1 mid-ramp. The fixed ten-second gap that avoided this
+  is now a cap: it waits for fan 1 to actually arrive. A one-level change went
+  from 10 s to 2.3 s. The manual slider also used to *cancel* the pending fan 2
+  write on every new request, which left fan 2 stuck at an old speed while fan 1
+  followed every step; it now coalesces to the newest value instead.
+
+### Interface
+
+A light mauve theme in place of the dark one, with the palette shared between
+the GTK stylesheet and the cairo gauges so a retheme is one file. The cooling
+profile is four linked toggles rather than a dropdown — which also fixed a bug
+where simply opening the window knocked the machine out of Better Auto, because
+grouping the toggles made GTK activate the first one and that reached the
+backend as a real mode change. Added a five-minute rolling plot of temperatures
+and fan speeds, a segment meter showing the Better Auto level with the reason
+behind it, and an icon set drawn in-app instead of borrowing whichever symbolic
+icons the desktop ships (a fan was previously drawn with a *weather* glyph).
+
+### Monitor
+
+The sustained-temperature alerts only reset their streak once the temperature
+fell a full 5 °C below the threshold, so a turbo spike started the clock,
+readings in between kept it running, and the next spike some seconds later fired
+an alert claiming the CPU had been above 90 °C the whole time. It never had. The
+streak now breaks on any reading below the threshold. The 85 °C and 90 °C CPU
+alerts were dropped as well: Tjmax here is 100 °C and this chip is built to sit
+in the 80s under load, so they fired during ordinary gaming and compiling.
+
+---
+
+Anything here that is not specific to board `8BC8` is welcome back upstream.
 
 ---
 
