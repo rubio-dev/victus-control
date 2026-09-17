@@ -1,34 +1,52 @@
 #include <gtk/gtk.h>
 
+#include <string>
+
+#include "palette.hpp"
 #include "style.hpp"
 
 namespace {
 
-// Dark "performance" palette in the spirit of the Victus chassis: a near-black
-// carbon base, cool grey panels, and an electric cyan accent, with amber and
-// red reserved for temperature warnings so colour always carries meaning.
-const char *kVictusCss = R"CSS(
-@define-color victus_bg          #0a0d12;
-@define-color victus_surface     #121822;
-@define-color victus_surface_alt #18202c;
-@define-color victus_border      #243040;
-@define-color victus_accent      #00d9ff;
-@define-color victus_accent_dim  #0596b3;
-@define-color victus_text        #e6edf5;
-@define-color victus_text_dim    #7d8da3;
-@define-color victus_warn        #ffa726;
-@define-color victus_hot         #ff4757;
-@define-color victus_ok          #00e676;
+// A light palette: off-white structure, pastel accents, and temperature keeping
+// the only loud colours in the app so that hue always means something. The
+// values live in palette.cpp, shared with the cairo gauges; the definitions
+// below are generated from them so the two can never drift apart.
+std::string colour_definitions()
+{
+	const VictusPalette &p = victus_palette();
+	std::string css;
 
-/* GTK draws radios, focus rings and selections from its own accent colours,
-   which follow the desktop's accent (orange on Ubuntu) and would otherwise
-   clash with everything here. Point them at the app accent. */
-@define-color accent_color @victus_accent;
-@define-color accent_bg_color @victus_accent;
-@define-color accent_fg_color #06222b;
-@define-color theme_selected_bg_color @victus_accent;
-@define-color theme_selected_fg_color #06222b;
+	auto define = [&css](const char *name, const VictusColor &colour) {
+		css += "@define-color " + std::string(name) + " " + victus_hex(colour) + ";\n";
+	};
 
+	define("victus_bg", p.bg);
+	define("victus_surface", p.surface);
+	define("victus_surface_alt", p.surface_alt);
+	define("victus_border", p.border);
+	define("victus_accent", p.accent);
+	define("victus_accent_dim", p.accent_dim);
+	define("victus_accent_fg", p.accent_fg);
+	define("victus_text", p.text);
+	define("victus_text_dim", p.text_dim);
+	define("victus_warn", p.warn);
+	define("victus_hot", p.hot);
+	define("victus_ok", p.ok);
+	define("victus_trough", p.trough);
+
+	// GTK draws radios, focus rings and selections from its own accent colours,
+	// which follow the desktop's accent (orange on Ubuntu) and would otherwise
+	// clash with everything here. Point them at the app accent.
+	css += "@define-color accent_color @victus_accent;\n";
+	css += "@define-color accent_bg_color @victus_accent;\n";
+	css += "@define-color accent_fg_color @victus_accent_fg;\n";
+	css += "@define-color theme_selected_bg_color @victus_accent;\n";
+	css += "@define-color theme_selected_fg_color @victus_accent_fg;\n";
+
+	return css;
+}
+
+const char *kVictusCssBody = R"CSS(
 window,
 .victus-root {
   background-color: @victus_bg;
@@ -38,9 +56,8 @@ window,
 
 /* Title bar: a slim carbon strip with an accent hairline under it. */
 headerbar {
-  background: linear-gradient(180deg, #151d29 0%, #0d1219 100%);
-  border-bottom: 1px solid @victus_accent_dim;
-  box-shadow: 0 1px 12px rgba(0, 217, 255, 0.18);
+  background: linear-gradient(180deg, @victus_surface 0%, @victus_surface_alt 100%);
+  border-bottom: 1px solid @victus_border;
   min-height: 42px;
   padding: 0 6px;
 }
@@ -49,7 +66,6 @@ headerbar label {
   font-weight: 700;
   letter-spacing: 2px;
   color: @victus_text;
-  text-shadow: 0 0 10px rgba(0, 217, 255, 0.55);
 }
 
 /* Tabs read as angular console buttons, with the active one underlined. */
@@ -75,13 +91,13 @@ notebook > header > tabs > tab {
 
 notebook > header > tabs > tab:hover {
   color: @victus_text;
-  background-color: rgba(0, 217, 255, 0.06);
+  background-color: alpha(@victus_accent, 0.10);
 }
 
 notebook > header > tabs > tab:checked {
   color: @victus_accent;
   border-bottom-color: @victus_accent;
-  background-color: rgba(0, 217, 255, 0.09);
+  background-color: alpha(@victus_accent, 0.16);
 }
 
 notebook > stack,
@@ -109,12 +125,13 @@ scrollbar slider:hover {
 .victus-card {
   background-color: @victus_surface;
   border: 1px solid @victus_border;
-  border-radius: 4px;
+  border-radius: 10px;
   padding: 16px;
+  box-shadow: 0 1px 3px alpha(@victus_text, 0.07);
 }
 
 .victus-card:hover {
-  border-color: alpha(@victus_accent, 0.35);
+  border-color: alpha(@victus_accent, 0.55);
 }
 
 /* Small uppercase heading that labels a panel. */
@@ -122,8 +139,7 @@ scrollbar slider:hover {
   font-size: 11px;
   font-weight: 800;
   letter-spacing: 2.4px;
-  color: @victus_accent;
-  text-shadow: 0 0 8px rgba(0, 217, 255, 0.35);
+  color: @victus_accent_fg;
 }
 
 .section-icon {
@@ -140,7 +156,7 @@ scrollbar slider:hover {
 .notice {
   color: @victus_warn;
   font-size: 12px;
-  background-color: rgba(255, 167, 38, 0.08);
+  background-color: alpha(@victus_warn, 0.12);
   border-left: 3px solid @victus_warn;
   border-radius: 2px;
   padding: 8px 10px;
@@ -158,13 +174,12 @@ scrollbar slider:hover {
   font-family: "JetBrains Mono", "Fira Code", "DejaVu Sans Mono", monospace;
   font-size: 22px;
   font-weight: 700;
-  color: @victus_accent;
-  text-shadow: 0 0 14px rgba(0, 217, 255, 0.45);
+  color: @victus_accent_fg;
 }
 
-.readout.warn { color: @victus_warn; text-shadow: 0 0 14px rgba(255, 167, 38, 0.45); }
-.readout.hot  { color: @victus_hot;  text-shadow: 0 0 16px rgba(255, 71, 87, 0.55); }
-.readout.ok   { color: @victus_ok;   text-shadow: 0 0 14px rgba(0, 230, 118, 0.40); }
+.readout.warn { color: @victus_warn; }
+.readout.hot  { color: @victus_hot; }
+.readout.ok   { color: @victus_ok; }
 
 .readout-unit {
   font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
@@ -194,12 +209,12 @@ button {
 button:hover {
   border-color: @victus_accent;
   color: @victus_accent;
-  box-shadow: 0 0 14px rgba(0, 217, 255, 0.22);
+  box-shadow: 0 1px 4px alpha(@victus_accent, 0.35);
 }
 
 button:active {
   background: @victus_accent_dim;
-  color: @victus_bg;
+  color: @victus_accent_fg;
 }
 
 button:disabled {
@@ -212,13 +227,13 @@ button:disabled {
 button.primary-action {
   background: linear-gradient(180deg, @victus_accent 0%, @victus_accent_dim 100%);
   border-color: @victus_accent;
-  color: #06222b;
+  color: @victus_accent_fg;
   font-weight: 800;
 }
 
 button.primary-action:hover {
-  box-shadow: 0 0 22px rgba(0, 217, 255, 0.5);
-  color: #06222b;
+  box-shadow: 0 2px 8px alpha(@victus_accent, 0.45);
+  color: @victus_accent_fg;
 }
 
 /* Power toggle reads as lit when the backlight is on. */
@@ -230,7 +245,7 @@ button.power-toggle {
 button.power-toggle.is-on {
   border-color: @victus_ok;
   color: @victus_ok;
-  box-shadow: 0 0 16px rgba(0, 230, 118, 0.25) inset;
+  background: alpha(@victus_ok, 0.14);
 }
 
 button.power-toggle.is-off {
@@ -240,7 +255,7 @@ button.power-toggle.is-off {
 
 /* Material-style backlight switch: pill track, circular knob, accent when on. */
 switch {
-  background-color: #0c1119;
+  background-color: @victus_trough;
   border: 1px solid @victus_border;
   border-radius: 15px;
   min-width: 50px;
@@ -253,11 +268,11 @@ switch {
 switch:checked {
   background-color: @victus_accent_dim;
   border-color: @victus_accent;
-  box-shadow: 0 0 16px rgba(0, 217, 255, 0.45);
+  box-shadow: 0 1px 3px alpha(@victus_text, 0.12);
 }
 
 switch > slider {
-  background: @victus_text_dim;
+  background: @victus_surface;
   border: none;
   border-radius: 50%;
   min-width: 20px;
@@ -293,7 +308,7 @@ checkbutton.style-radio:checked {
 
 checkbutton.style-radio > radio,
 checkbutton.style-radio > check {
-  background-color: #0c1119;
+  background-color: @victus_surface;
   border: 1px solid @victus_border;
   min-width: 15px;
   min-height: 15px;
@@ -307,8 +322,47 @@ checkbutton.style-radio check:checked {
   background-color: @victus_accent;
   background-image: none;
   border-color: @victus_accent;
-  color: @victus_bg;
-  box-shadow: 0 0 10px rgba(0, 217, 255, 0.6);
+  color: @victus_accent_fg;
+}
+
+/* Cooling profile: four linked toggles that read as one control. Every option
+   is on screen, so choosing a profile is one click and no popup. */
+.mode-bar {
+  margin-top: 2px;
+}
+
+button.mode-button {
+  background: @victus_surface;
+  border: 1px solid @victus_border;
+  color: @victus_text_dim;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 1.2px;
+  padding: 10px 12px;
+  box-shadow: none;
+}
+
+button.mode-button:hover {
+  background: alpha(@victus_accent, 0.10);
+  color: @victus_accent_fg;
+  border-color: @victus_accent_dim;
+  box-shadow: none;
+}
+
+button.mode-button:checked {
+  background: linear-gradient(180deg, @victus_accent 0%, @victus_accent_dim 100%);
+  border-color: @victus_accent;
+  color: @victus_accent_fg;
+}
+
+button.mode-button:checked:hover {
+  background: @victus_accent;
+  color: @victus_accent_fg;
+}
+
+button.mode-button:disabled {
+  background: @victus_surface_alt;
+  color: alpha(@victus_text_dim, 0.6);
 }
 
 /* Sliders: thin dark rail, glowing accent fill, square-ish knob. */
@@ -317,7 +371,7 @@ scale {
 }
 
 scale trough {
-  background-color: #0c1119;
+  background-color: @victus_trough;
   border: 1px solid @victus_border;
   border-radius: 2px;
   min-height: 6px;
@@ -326,28 +380,28 @@ scale trough {
 scale highlight {
   background: linear-gradient(90deg, @victus_accent_dim 0%, @victus_accent 100%);
   border-radius: 2px;
-  box-shadow: 0 0 12px rgba(0, 217, 255, 0.55);
+  box-shadow: none;
 }
 
 scale slider {
-  background: @victus_text;
+  background: @victus_surface;
   border: 2px solid @victus_accent;
   border-radius: 3px;
   min-width: 14px;
   min-height: 14px;
   margin: -6px;
-  box-shadow: 0 0 10px rgba(0, 217, 255, 0.6);
+  box-shadow: 0 1px 3px alpha(@victus_text, 0.18);
   transition: box-shadow 160ms ease;
 }
 
 scale slider:hover {
-  box-shadow: 0 0 18px rgba(0, 217, 255, 0.9);
+  box-shadow: 0 1px 6px alpha(@victus_accent, 0.55);
 }
 
 scale value {
   font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
   font-weight: 700;
-  color: @victus_accent;
+  color: @victus_accent_fg;
 }
 
 /* Dropdowns. */
@@ -370,7 +424,8 @@ popover > contents,
 dropdown popover > contents {
   background-color: @victus_surface;
   border: 1px solid @victus_border;
-  border-radius: 4px;
+  border-radius: 8px;
+  box-shadow: 0 2px 10px alpha(@victus_text, 0.12);
   color: @victus_text;
   padding: 4px;
 }
@@ -383,7 +438,7 @@ dropdown listview > row:selected {
 
 /* The drawn keyboard sits in its own recessed well. */
 .keyboard-stage {
-  background-color: #070a0e;
+  background-color: @victus_surface_alt;
   border: 1px solid @victus_border;
   border-radius: 4px;
   padding: 10px;
@@ -425,7 +480,8 @@ void apply_victus_style() {
   // it looks the same either way.
 
   GtkCssProvider *provider = gtk_css_provider_new();
-  gtk_css_provider_load_from_string(provider, kVictusCss);
+  const std::string css = colour_definitions() + kVictusCssBody;
+  gtk_css_provider_load_from_string(provider, css.c_str());
 
   gtk_style_context_add_provider_for_display(
       gdk_display_get_default(), GTK_STYLE_PROVIDER(provider),

@@ -83,6 +83,7 @@ VictusSocketClient::VictusSocketClient(const std::string &path) : socket_path(pa
       {GET_KBD_EFFECT, "GET_KBD_EFFECT"},
       {SET_KBD_EFFECT, "SET_KBD_EFFECT"},
       {GET_KEYBOARD_TYPE, "GET_KEYBOARD_TYPE"},
+      {GET_BETTER_AUTO_STATUS, "GET_BETTER_AUTO_STATUS"},
       {GET_CPU_TEMP, "GET_CPU_TEMP"},
       {GET_GPU_TEMP, "GET_GPU_TEMP"},
   };

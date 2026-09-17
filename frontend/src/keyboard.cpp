@@ -1,4 +1,6 @@
 #include "keyboard.hpp"
+#include "icons.hpp"
+#include "palette.hpp"
 #include <algorithm>
 #include <cmath>
 #include <gtk/gtk.h>
@@ -167,7 +169,7 @@ void VictusKeyboardControl::build_ui_for_keyboard_type() {
   // Header: title on the left, backlight switch on the right.
   GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
   GtkWidget *header_icon =
-      gtk_image_new_from_icon_name("input-keyboard-symbolic");
+      victus_icon_new(VictusIcon::Keyboard, 18, victus_palette().accent_fg);
   gtk_widget_add_css_class(header_icon, "section-icon");
   GtkWidget *header_label = gtk_label_new("KEYBOARD LIGHTING");
   gtk_widget_add_css_class(header_label, "section-title");

@@ -10,6 +10,8 @@
 #include "about.hpp"
 #include "socket.hpp"
 #include "style.hpp"
+#include "icons.hpp"
+#include "palette.hpp"
 
 class VictusControl
 {
@@ -83,7 +85,8 @@ public:
 		gtk_header_bar_set_title_widget(GTK_HEADER_BAR(header_bar), title_label);
 
 		menu_button = gtk_menu_button_new();
-		gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(menu_button), "open-menu-symbolic");
+		gtk_menu_button_set_child(GTK_MENU_BUTTON(menu_button),
+			victus_icon_new(VictusIcon::Menu, 16, victus_palette().text_dim));
 		gtk_header_bar_pack_end(GTK_HEADER_BAR(header_bar), menu_button);
 
 		menu = gtk_popover_new();

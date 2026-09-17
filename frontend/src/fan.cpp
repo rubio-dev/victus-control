@@ -1,5 +1,7 @@
 #include "fan.hpp"
 #include "gauges.hpp"
+#include "icons.hpp"
+#include "palette.hpp"
 #include "socket.hpp"
 #include <iostream>
 #include <string>
@@ -8,6 +10,8 @@
 #include <cmath>
 #include <algorithm>
 #include <memory>
+#include <sstream>
+#include <vector>
 
 namespace {
 // Carries the strings produced by the off-thread refresh back to the GTK main
@@ -18,13 +22,16 @@ struct FanLabelUpdate {
     std::string fan2;
     std::string cpu;
     std::string gpu;
+    std::string better_auto;   // "<level> <steps> <TEMP|LOAD> <value>" or "INACTIVE"
 };
 } // namespace
 
 // Constants for manual fan control
 const int MIN_RPM = 2000;
-const int FAN1_MAX_RPM = 5800;
-const int FAN2_MAX_RPM = 6100;
+// Measured on the hardware in MAX: both fans top out at ~5100. The driver
+// reports fanN_max as 0 on this board, so nothing can read it back at runtime.
+const int FAN1_MAX_RPM = 5100;
+const int FAN2_MAX_RPM = 5100;
 const int RPM_STEPS = 8;
 
 namespace {
@@ -50,7 +57,7 @@ void apply_temperature_class(GtkWidget *label, const std::string &value)
 // One telemetry dial: caption, the analog gauge, then the digital value under
 // it, so the shape gives the impression and the number gives the detail.
 GtkWidget *make_gauge_tile(const char *caption, const char *unit,
-                           const char *icon_name, int gauge_width,
+                           VictusIcon icon, int gauge_width,
                            int gauge_height, GtkDrawingAreaDrawFunc draw_func,
                            gpointer draw_data, GtkWidget **gauge_out,
                            GtkWidget **value_out)
@@ -60,8 +67,7 @@ GtkWidget *make_gauge_tile(const char *caption, const char *unit,
     gtk_widget_set_halign(tile, GTK_ALIGN_CENTER);
 
     GtkWidget *caption_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    GtkWidget *caption_icon = gtk_image_new_from_icon_name(icon_name);
-    gtk_widget_add_css_class(caption_icon, "tile-icon");
+    GtkWidget *caption_icon = victus_icon_new(icon, 14, victus_palette().text_dim);
     GtkWidget *caption_label = gtk_label_new(caption);
     gtk_widget_add_css_class(caption_label, "field-label");
     gtk_box_append(GTK_BOX(caption_row), caption_icon);
@@ -94,6 +100,41 @@ GtkWidget *make_gauge_tile(const char *caption, const char *unit,
     return tile;
 }
 
+// Turn the backend's "3 8 TEMP 55" into something worth reading, plus the
+// numbers behind it. Better Auto decides a level every couple of seconds and
+// used to say nothing about it, so the card showed a greyed-out slider and left
+// the user guessing.
+struct BetterAutoStatus {
+    bool active = false;
+    int level = 0;
+    int steps = 8;
+    std::string text;
+};
+
+BetterAutoStatus describe_better_auto(const std::string &status, const std::string &mode)
+{
+    BetterAutoStatus out;
+    std::istringstream iss(status);
+    std::string driver;
+    int value = 0;
+
+    if (!(iss >> out.level >> out.steps >> driver >> value) || out.level <= 0 ||
+        out.steps <= 0) {
+        out.level = 0;
+        out.text = "Current State: " + mode;
+        return out;
+    }
+
+    std::string reason = (driver == "LOAD")
+        ? "following load, " + std::to_string(value) + "%"
+        : "following temperature, " + std::to_string(value) + "\u00b0C";
+
+    out.active = true;
+    out.text = "Better Auto \u2014 level " + std::to_string(out.level) + " of " +
+               std::to_string(out.steps) + " \u00b7 " + reason;
+    return out;
+}
+
 } // namespace
 
 VictusFanControl::VictusFanControl(std::shared_ptr<VictusSocketClient> client) : socket_client(client)
@@ -104,64 +145,97 @@ VictusFanControl::VictusFanControl(std::shared_ptr<VictusSocketClient> client) :
     gtk_widget_set_margin_start(fan_page, 20);
     gtk_widget_set_margin_end(fan_page, 20);
 
-    // --- Header: title left, cooling profile right ---
+    // --- Header ---
     GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-    GtkWidget *header_icon = gtk_image_new_from_icon_name("weather-windy-symbolic");
-    gtk_widget_add_css_class(header_icon, "section-icon");
+    GtkWidget *header_icon = victus_icon_new(VictusIcon::Fan, 18, victus_palette().accent_fg);
     GtkWidget *header_label = gtk_label_new("COOLING");
     gtk_widget_add_css_class(header_label, "section-title");
-    GtkWidget *header_spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_widget_set_hexpand(header_spacer, TRUE);
-
-    mode_selector = gtk_combo_box_text_new();
-    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(mode_selector), "AUTO", "AUTO");
-    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(mode_selector), "BETTER_AUTO", "Better Auto");
-    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(mode_selector), "MANUAL", "MANUAL");
-    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(mode_selector), "MAX", "MAX");
-    g_signal_connect(mode_selector, "changed", G_CALLBACK(on_mode_changed), this);
 
     gtk_box_append(GTK_BOX(header), header_icon);
     gtk_box_append(GTK_BOX(header), header_label);
-    gtk_box_append(GTK_BOX(header), header_spacer);
-    gtk_box_append(GTK_BOX(header), mode_selector);
     gtk_box_append(GTK_BOX(fan_page), header);
+
+    // --- Cooling profile: one row of linked toggles ---
+    mode_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class(mode_bar, "linked");
+    gtk_widget_add_css_class(mode_bar, "mode-bar");
+    gtk_widget_set_halign(mode_bar, GTK_ALIGN_FILL);
+
+    add_mode_button("AUTO", "AUTO");
+    add_mode_button("BETTER AUTO", "BETTER_AUTO");
+    add_mode_button("MANUAL", "MANUAL");
+    add_mode_button("MAX", "MAX");
+
+    gtk_box_append(GTK_BOX(fan_page), mode_bar);
 
     // --- Analog dials ---
     GtkWidget *dial_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 26);
     gtk_widget_set_halign(dial_row, GTK_ALIGN_CENTER);
 
     gtk_box_append(GTK_BOX(dial_row),
-        make_gauge_tile("FAN 1", "RPM", "weather-windy-symbolic", 104, 104,
+        make_gauge_tile("FAN 1", "RPM", VictusIcon::Fan, 104, 104,
                         draw_fan1, this, &fan1_gauge, &fan1_speed_label));
     gtk_box_append(GTK_BOX(dial_row),
-        make_gauge_tile("FAN 2", "RPM", "weather-windy-symbolic", 104, 104,
+        make_gauge_tile("FAN 2", "RPM", VictusIcon::Fan, 104, 104,
                         draw_fan2, this, &fan2_gauge, &fan2_speed_label));
     gtk_box_append(GTK_BOX(dial_row),
-        make_gauge_tile("CPU", "\u00b0C", "computer-symbolic", 46, 104,
+        make_gauge_tile("CPU", "\u00b0C", VictusIcon::Cpu, 46, 104,
                         draw_cpu, this, &cpu_gauge, &cpu_temp_label));
     gtk_box_append(GTK_BOX(dial_row),
-        make_gauge_tile("GPU", "\u00b0C", "video-display-symbolic", 46, 104,
+        make_gauge_tile("GPU", "\u00b0C", VictusIcon::Gpu, 46, 104,
                         draw_gpu, this, &gpu_gauge, &gpu_temp_label));
 
     gtk_box_append(GTK_BOX(fan_page), dial_row);
 
-    // --- Manual speed (only meaningful where the firmware accepts targets) ---
-    manual_speed_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    // --- Manual speed, under the dials it drives, and only in MANUAL ---
+    manual_speed_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_set_margin_top(manual_speed_box, 4);
     slider_label = gtk_label_new("MANUAL SPEED");
     gtk_widget_add_css_class(slider_label, "field-label");
     gtk_box_append(GTK_BOX(manual_speed_box), slider_label);
 
     speed_slider = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 1, RPM_STEPS, 1);
     gtk_scale_set_draw_value(GTK_SCALE(speed_slider), TRUE);
+    // Above the trough the value sits on top of the label next to it, so put it
+    // at the end of the rail instead.
+    gtk_scale_set_value_pos(GTK_SCALE(speed_slider), GTK_POS_RIGHT);
+    // "4" says nothing on its own; show what the level actually asks the fans for.
+    gtk_scale_set_format_value_func(
+        GTK_SCALE(speed_slider),
+        +[](GtkScale *, double value, gpointer) -> char * {
+            int level = std::clamp(static_cast<int>(value), 1, RPM_STEPS);
+            double step = static_cast<double>(FAN1_MAX_RPM - MIN_RPM) / (RPM_STEPS - 1);
+            int rpm = static_cast<int>(std::round(MIN_RPM + (level - 1) * step));
+            return g_strdup_printf("%d \u00b7 %d RPM", level, rpm);
+        },
+        nullptr, nullptr);
     gtk_widget_set_hexpand(speed_slider, TRUE);
     g_signal_connect(speed_slider, "value-changed", G_CALLBACK(on_speed_slider_changed), this);
     gtk_box_append(GTK_BOX(manual_speed_box), speed_slider);
     gtk_box_append(GTK_BOX(fan_page), manual_speed_box);
 
+    // --- What the controller is doing ---
+    GtkWidget *status_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_set_halign(status_row, GTK_ALIGN_CENTER);
+
+    level_meter = gtk_drawing_area_new();
+    gtk_widget_set_size_request(level_meter, 104, 12);
+    gtk_widget_set_valign(level_meter, GTK_ALIGN_CENTER);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(level_meter), draw_level, this, nullptr);
+    gtk_box_append(GTK_BOX(status_row), level_meter);
+
     state_label = gtk_label_new("Current State: N/A");
     gtk_widget_add_css_class(state_label, "status-line");
-    gtk_widget_set_halign(state_label, GTK_ALIGN_CENTER);
-    gtk_box_append(GTK_BOX(fan_page), state_label);
+    gtk_box_append(GTK_BOX(status_row), state_label);
+    gtk_box_append(GTK_BOX(fan_page), status_row);
+
+    // --- Rolling history ---
+    history_plot = gtk_drawing_area_new();
+    gtk_widget_set_size_request(history_plot, -1, 128);
+    gtk_widget_set_hexpand(history_plot, TRUE);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(history_plot), draw_history,
+                                   this, nullptr);
+    gtk_box_append(GTK_BOX(fan_page), history_plot);
 
     // Boards whose firmware refuses software fan control never expose
     // fan*_target, so neither manual speed nor Better Auto (which steers the
@@ -179,11 +253,13 @@ VictusFanControl::VictusFanControl(std::shared_ptr<VictusSocketClient> client) :
 
     if (!fan_targets_supported) {
         gtk_widget_set_visible(manual_speed_box, FALSE);
-        // Remove the higher index first so the lower one keeps its position.
-        gtk_combo_box_text_remove(GTK_COMBO_BOX_TEXT(mode_selector), 2);  // MANUAL
-        gtk_combo_box_text_remove(GTK_COMBO_BOX_TEXT(mode_selector), 1);  // Better Auto
+        gtk_widget_set_visible(status_row, FALSE);
+        for (const auto &entry : mode_buttons) {
+            if (entry->mode == "MANUAL" || entry->mode == "BETTER_AUTO")
+                gtk_widget_set_visible(entry->button, FALSE);
+        }
         if (fan_control_disabled)
-            gtk_widget_set_sensitive(mode_selector, FALSE);
+            gtk_widget_set_sensitive(mode_bar, FALSE);
 
         const char *text = fan_control_disabled
             ? "Fan control is switched off for this machine "
@@ -202,11 +278,10 @@ VictusFanControl::VictusFanControl(std::shared_ptr<VictusSocketClient> client) :
     gauge_last_frame_us = g_get_monotonic_time();
     gauge_tick_id = g_timeout_add(33, on_gauge_tick, this);
 
-    // Block "changed" signal during init so set_active_id doesn't fire
-    // on_mode_changed and reset fan speeds with the slider's default value.
-    g_signal_handlers_block_by_func(mode_selector, (gpointer)on_mode_changed, this);
+    // select_mode_button() blocks each toggle's handler while it syncs, so
+    // reflecting the current mode here cannot re-send it to the backend.
     update_ui_from_system_state();
-    g_signal_handlers_unblock_by_func(mode_selector, (gpointer)on_mode_changed, this);
+    connect_mode_buttons();
 
     update_fan_speeds();
 
@@ -232,22 +307,27 @@ void VictusFanControl::update_ui_from_system_state()
         std::cerr << "Failed to get fan mode, defaulting to AUTO." << std::endl;
     }
 
+    last_known_mode = fan_mode;
     gtk_label_set_text(GTK_LABEL(state_label), ("Current State: " + fan_mode).c_str());
 
+    // The slider only means anything in MANUAL, so it is shown there and
+    // nowhere else rather than sitting greyed out under every other profile.
+    gtk_widget_set_visible(manual_speed_box, fan_targets_supported && fan_mode == "MANUAL");
+
     if (fan_mode == "MANUAL") {
-        gtk_combo_box_set_active_id(GTK_COMBO_BOX(mode_selector), "MANUAL");
+        select_mode_button("MANUAL");
         gtk_widget_set_sensitive(speed_slider, TRUE);
         gtk_widget_set_sensitive(slider_label, TRUE);
     } else if (fan_mode == "BETTER_AUTO") {
-        gtk_combo_box_set_active_id(GTK_COMBO_BOX(mode_selector), "BETTER_AUTO");
+        select_mode_button("BETTER_AUTO");
         gtk_widget_set_sensitive(speed_slider, FALSE);
         gtk_widget_set_sensitive(slider_label, FALSE);
     } else if (fan_mode == "MAX") {
-        gtk_combo_box_set_active_id(GTK_COMBO_BOX(mode_selector), "MAX");
+        select_mode_button("MAX");
         gtk_widget_set_sensitive(speed_slider, FALSE);
         gtk_widget_set_sensitive(slider_label, FALSE);
     } else { // AUTO
-        gtk_combo_box_set_active_id(GTK_COMBO_BOX(mode_selector), "AUTO");
+        select_mode_button("AUTO");
         gtk_widget_set_sensitive(speed_slider, FALSE);
         gtk_widget_set_sensitive(slider_label, FALSE);
     }
@@ -272,6 +352,7 @@ void VictusFanControl::update_fan_speeds()
         auto response2 = socket_client->send_command_async(GET_FAN_SPEED, "2");
         auto response_temp = socket_client->send_command_async(GET_CPU_TEMP);
         auto response_gpu_temp = socket_client->send_command_async(GET_GPU_TEMP);
+        auto response_better_auto = socket_client->send_command_async(GET_BETTER_AUTO_STATUS);
 
         std::string fan1_speed = response1.get();
         if (fan1_speed.find("ERROR") != std::string::npos) fan1_speed = "N/A";
@@ -294,8 +375,12 @@ void VictusFanControl::update_fan_speeds()
         }
 
         // The tiles carry their own captions and units, so only the value goes here.
+        std::string better_auto = response_better_auto.get();
+        if (better_auto.find("ERROR") != std::string::npos)
+            better_auto = "INACTIVE";
+
         auto *payload = new FanLabelUpdate{
-            this, fan1_speed, fan2_speed, cpu_temp, gpu_temp_text};
+            this, fan1_speed, fan2_speed, cpu_temp, gpu_temp_text, better_auto};
 
         g_idle_add(
             +[](gpointer data) -> gboolean {
@@ -317,6 +402,23 @@ void VictusFanControl::update_fan_speeds()
                 to_number(u->fan2, &self->fan2_rpm);
                 self->cpu_valid = to_number(u->cpu, &self->cpu_celsius);
                 self->gpu_valid = to_number(u->gpu, &self->gpu_celsius);
+
+                BetterAutoStatus status =
+                    describe_better_auto(u->better_auto, self->last_known_mode);
+                gtk_label_set_text(GTK_LABEL(self->state_label), status.text.c_str());
+                self->better_auto_level = status.level;
+                self->better_auto_steps = status.steps;
+                if (self->level_meter) {
+                    // An empty row of segments under AUTO or MAX says nothing.
+                    gtk_widget_set_visible(self->level_meter, status.active);
+                    gtk_widget_queue_draw(self->level_meter);
+                }
+
+                self->push_history(self->cpu_valid ? self->cpu_celsius : -1.0,
+                                   self->gpu_valid ? self->gpu_celsius : -1.0,
+                                   self->fan1_rpm, self->fan2_rpm);
+                if (self->history_plot)
+                    gtk_widget_queue_draw(self->history_plot);
 
                 gtk_widget_queue_draw(self->cpu_gauge);
                 gtk_widget_queue_draw(self->gpu_gauge);
@@ -344,54 +446,126 @@ void VictusFanControl::set_fan_rpm(int level)
         return rpm;
     };
 
-    int fan1_rpm = compute_rpm(level, FAN1_MAX_RPM);
-    int fan2_rpm = compute_rpm(level, FAN2_MAX_RPM);
+    const std::string fan1_rpm_str = std::to_string(compute_rpm(level, FAN1_MAX_RPM));
+    {
+        std::lock_guard<std::mutex> lock(manual_mutex);
+        pending_fan2_rpm = compute_rpm(level, FAN2_MAX_RPM);
+    }
 
-    std::string fan1_rpm_str = std::to_string(fan1_rpm);
-    std::string fan2_rpm_str = std::to_string(fan2_rpm);
-    unsigned long long generation =
-        manual_request_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    // Fan 1 goes out straight away.
+    std::thread([this, fan1_rpm_str]() {
+        auto result = socket_client->send_command_async(SET_FAN_SPEED, "1 " + fan1_rpm_str).get();
+        if (result != "OK")
+            std::cerr << "Failed to set fan 1 speed: " << result << std::endl;
+    }).detach();
 
-    // Apply fan 1 immediately, but only let the newest request schedule fan 2
-    // after the firmware-required delay.
-    std::thread([this, fan1_rpm_str, fan2_rpm_str, generation]() {
-        auto fan1_result =
-            socket_client->send_command_async(SET_FAN_SPEED,
-                                              "1 " + fan1_rpm_str)
-                .get();
-        if (fan1_result != "OK") {
-            std::cerr << "Failed to set fan 1 speed: " << fan1_result
-                      << std::endl;
-            return;
-        }
+    // Fan 2 is handled by one writer that waits out the gap and then sends
+    // whatever the latest request asked for, so moving the slider again
+    // supersedes the pending value instead of cancelling it.
+    bool expected = false;
+    if (!fan2_writer_active.compare_exchange_strong(expected, true))
+        return;
 
-        std::this_thread::sleep_for(std::chrono::seconds(10));
+    std::thread([this]() {
+        int last_sent = -1;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
 
-        if (manual_request_generation.load(std::memory_order_acquire) !=
-            generation) {
-            return;
-        }
+            int target = 0;
+            {
+                std::lock_guard<std::mutex> lock(manual_mutex);
+                target = pending_fan2_rpm;
+            }
 
-        auto fan2_result =
-            socket_client->send_command_async(SET_FAN_SPEED,
-                                              "2 " + fan2_rpm_str)
-                .get();
-        if (fan2_result != "OK") {
-            std::cerr << "Failed to set fan 2 speed: " << fan2_result
-                      << std::endl;
+            if (target != last_sent) {
+                auto result = socket_client
+                                  ->send_command_async(SET_FAN_SPEED,
+                                                       "2 " + std::to_string(target))
+                                  .get();
+                if (result != "OK")
+                    std::cerr << "Failed to set fan 2 speed: " << result << std::endl;
+                last_sent = target;
+                continue;  // it may have moved again while that was in flight
+            }
+
+            // Nothing new to send. Stand down, then look once more: a request
+            // that landed while we were deciding would have found the writer
+            // still marked active and started no replacement.
+            fan2_writer_active.store(false, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(manual_mutex);
+                if (pending_fan2_rpm == last_sent)
+                    return;
+            }
+            bool expected_restart = false;
+            if (!fan2_writer_active.compare_exchange_strong(expected_restart, true))
+                return;  // someone else picked it up
         }
     }).detach();
 }
 
-void VictusFanControl::on_mode_changed(GtkComboBox *widget, gpointer data)
+void VictusFanControl::add_mode_button(const char *label, const char *mode)
 {
-    VictusFanControl *self = static_cast<VictusFanControl*>(data);
-    // get_active_id returns a const pointer owned by GTK — copy immediately, never free
-    const gchar *active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(widget));
-    if (!active_id) return;
-    std::string mode_str(active_id);
+    auto entry = std::make_unique<ModeButton>();
+    entry->mode = mode;
+    entry->owner = this;
+    entry->button = gtk_toggle_button_new_with_label(label);
+    gtk_widget_add_css_class(entry->button, "mode-button");
+    gtk_widget_set_hexpand(entry->button, TRUE);
 
-    // Send the mode command and wait for it to complete.
+    // One group, so selecting a profile releases the previous one for us.
+    if (!mode_buttons.empty())
+        gtk_toggle_button_set_group(GTK_TOGGLE_BUTTON(entry->button),
+                                    GTK_TOGGLE_BUTTON(mode_buttons.front()->button));
+
+    // The handler is deliberately not connected here. Grouping toggles makes
+    // GTK activate the first member, and a "toggled" arriving during
+    // construction would send the backend a profile the user never picked --
+    // which is how opening the window used to knock the machine out of Better
+    // Auto. connect_mode_buttons() wires them up once the UI is in sync.
+    gtk_box_append(GTK_BOX(mode_bar), entry->button);
+    mode_buttons.push_back(std::move(entry));
+}
+
+void VictusFanControl::connect_mode_buttons()
+{
+    for (const auto &entry : mode_buttons)
+        g_signal_connect(entry->button, "toggled", G_CALLBACK(on_mode_button_toggled),
+                         entry.get());
+}
+
+// Reflect a mode the backend reported, without bouncing it back as a command.
+void VictusFanControl::select_mode_button(const std::string &mode)
+{
+    // Only ever activate the wanted button: the group releases the previous one
+    // by itself, and asking GTK to deactivate the group's only active member
+    // gets reverted -- firing "toggled" as if the user had clicked it. Blocking
+    // every handler, not just the target's, covers that reversal too.
+    for (const auto &entry : mode_buttons)
+        g_signal_handlers_block_by_func(entry->button,
+                                        (gpointer)on_mode_button_toggled, entry.get());
+
+    for (const auto &entry : mode_buttons) {
+        if (entry->mode == mode)
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(entry->button), TRUE);
+    }
+
+    for (const auto &entry : mode_buttons)
+        g_signal_handlers_unblock_by_func(entry->button,
+                                          (gpointer)on_mode_button_toggled, entry.get());
+}
+
+void VictusFanControl::on_mode_button_toggled(GtkToggleButton *button, gpointer data)
+{
+    ModeButton *entry = static_cast<ModeButton *>(data);
+    // Grouped toggles fire twice per change: once for the button being released
+    // and once for the one taking over. Only the latter is a request.
+    if (!gtk_toggle_button_get_active(button))
+        return;
+
+    VictusFanControl *self = entry->owner;
+    const std::string mode_str = entry->mode;
+
     auto result = self->socket_client->send_command_async(SET_FAN_MODE, mode_str).get();
 
     if (result == "OK") {
@@ -406,16 +580,14 @@ void VictusFanControl::on_mode_changed(GtkComboBox *widget, gpointer data)
         std::cerr << "Failed to set fan mode: " << result << std::endl;
     }
 
-    // After all commands are sent, update the UI to reflect the final state.
     self->update_ui_from_system_state();
 }
 
 void VictusFanControl::on_speed_slider_changed(GtkRange *range, gpointer data)
 {
     VictusFanControl *self = static_cast<VictusFanControl*>(data);
-    const char *active_id =
-        gtk_combo_box_get_active_id(GTK_COMBO_BOX(self->mode_selector));
-    if (!active_id || std::string(active_id) != "MANUAL") {
+    // The slider only commands the fans while MANUAL is the selected profile.
+    if (self->last_known_mode != "MANUAL") {
         return;
     }
 
@@ -475,4 +647,35 @@ void VictusFanControl::draw_gpu(GtkDrawingArea *, cairo_t *cr, int w, int h, gpo
 {
     VictusFanControl *self = static_cast<VictusFanControl *>(data);
     draw_thermometer(cr, w, h, self->gpu_celsius, 100.0, self->gpu_valid);
+}
+
+void VictusFanControl::draw_history(GtkDrawingArea *, cairo_t *cr, int w, int h, gpointer data)
+{
+    VictusFanControl *self = static_cast<VictusFanControl *>(data);
+    // Both fans share the plot's RPM band, so scale it to the faster of the two
+    // ceilings rather than letting fan 2 clip against fan 1's maximum.
+    const double max_rpm = std::max(FAN1_MAX_RPM, FAN2_MAX_RPM);
+    draw_history_plot(cr, w, h, self->history_cpu_c, self->history_gpu_c,
+                      self->history_fan1_rpm, self->history_fan2_rpm,
+                      kHistoryCapacity, max_rpm, kHistorySpanMinutes);
+}
+
+void VictusFanControl::push_history(double cpu_c, double gpu_c, double fan1, double fan2)
+{
+    auto push = [](std::vector<double> &series, double value) {
+        if (series.size() == kHistoryCapacity)
+            series.erase(series.begin());
+        series.push_back(value);
+    };
+
+    push(history_cpu_c, cpu_c);
+    push(history_gpu_c, gpu_c);
+    push(history_fan1_rpm, fan1);
+    push(history_fan2_rpm, fan2);
+}
+
+void VictusFanControl::draw_level(GtkDrawingArea *, cairo_t *cr, int w, int h, gpointer data)
+{
+    VictusFanControl *self = static_cast<VictusFanControl *>(data);
+    draw_level_meter(cr, w, h, self->better_auto_level, self->better_auto_steps);
 }
